@@ -1,0 +1,15 @@
+[Unit]
+Description=AIDA GPT - AI Assistant Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/aida-gpt
+Environment="PATH=/var/www/aida-gpt/venv/bin"
+ExecStart=/var/www/aida-gpt/venv/bin/python -u /var/www/aida-gpt/server.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

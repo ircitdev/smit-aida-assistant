@@ -9,6 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import httpx
+from email import message_from_string
+from html import unescape
+import re
 import os
 import json
 import uuid
@@ -30,6 +33,13 @@ from voice_gateway.clients.mango_client import MangoClient
 load_dotenv(".env")
 
 app = FastAPI(title="AIDA GPT API")
+
+# ==================== IVR DTMF CACHE ====================
+# Store DTMF key presses temporarily to route calls
+dtmf_cache = {}  # {entry_id: digit}
+voicemail_cache = {}  # {entry_id: {from_number, recording_url, call_duration, pressed_key}}
+last_voicemail_data = None  # Данные последнего звонка для email endpoint
+
 
 # CORS
 app.add_middleware(
@@ -311,22 +321,23 @@ async def fetch_billing_by_phone(phone: str) -> Dict[str, Any]:
             tariff = client.get("tariff", "")
             address = client.get("address", "")
 
+            # Extract only first name for GDPR compliance
+            first_name = fullname.split()[0] if fullname else ""
+            
             return {
                 "success": True,
                 "phone": phone,
-                "fullname": fullname,
+                "fullname": first_name,  # Only first name
                 "contract": contract,
                 "balance": balance,
                 "tariff": tariff,
-                "address": address,
-                "message": f"👤 {fullname}\n📄 Договор: {contract}\n💰 Баланс: {balance} руб.\n📦 Тариф: {tariff}\n📍 Адрес: {address}"
+                "address": "",  # Hidden for privacy
+                "message": f"👤 {first_name}\n📄 Договор: {contract}\n💰 Баланс: {balance} руб.\n📦 Тариф: {tariff}"
             }
 
         except Exception as e:
             return {"success": False, "message": f"Ошибка при запросе к биллингу: {str(e)}"}
 
-
-# ==================== ДОПОЛНИТЕЛЬНЫЕ УСЛУГИ ====================
 
 async def get_addons_gas() -> Dict[str, Any]:
     """Получает список дополнительных услуг (из кэша или API)"""
@@ -5055,7 +5066,167 @@ async def get_balance(request: Request):
     }
     """
     try:
-        data = await request.json()
+        # SendGrid sends form-data, not JSON
+        form_data = await request.form()
+        
+        # DEBUG: Print all form fields
+        print("🐛 [DEBUG] All form-data fields:")
+        for key in form_data.keys():
+            value = form_data.get(key, "")
+            print(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
+        
+        # Parse raw email from SendGrid
+        raw_email = form_data.get("email", "")
+        # DEBUG: Save raw email to file
+        if raw_email:
+            with open('/tmp/last_email.txt', 'w', encoding='utf-8') as f:
+                f.write(raw_email)
+            print(f"📧 [DEBUG] Raw email saved to /tmp/last_email.txt ({len(raw_email)} bytes)")
+        email_msg = message_from_string(raw_email) if raw_email else None
+        
+        # Extract plain text from email
+        plain_text = ""
+        html_text = ""
+        
+        if email_msg:
+            if email_msg.is_multipart():
+                for part in email_msg.walk():
+                    content_type = part.get_content_type()
+                    if content_type == "text/plain" and not plain_text:
+                        try:
+                            plain_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+                    elif content_type == "text/html" and not html_text:
+                        try:
+                            html_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+            else:
+                try:
+                    payload = email_msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    if email_msg.get_content_type() == "text/html":
+                        html_text = payload
+                    else:
+                        plain_text = payload
+                except:
+                    pass
+        
+        # If no plain text, extract from HTML
+        if not plain_text and html_text:
+            # Remove HTML tags and get text
+            plain_text = re.sub(r'<[^>]+>', ' ', html_text)
+            plain_text = unescape(plain_text)
+            # Clean up whitespace
+            plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        
+        print(f"📧 [DEBUG] Extracted plain text ({len(plain_text)} chars): {plain_text[:300]}")
+        print(f"📧 [DEBUG] Had HTML: {len(html_text) > 0}")
+        
+        # Extract attachment from email (MP3 or TXT)
+        mp3_data = None
+        mp3_filename = None
+        txt_transcription = None
+        
+        if email_msg and email_msg.is_multipart():
+            for part in email_msg.walk():
+                content_disposition = part.get("Content-Disposition", "")
+                content_type = part.get_content_type()
+                
+                # Check if this is an attachment
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    
+                    # Check for TXT file with transcription
+                    if filename and ".txt" in filename.lower():
+                        txt_data = part.get_payload(decode=True)
+                        try:
+                            # Decode the text
+                            txt_content = txt_data.decode('utf-8', errors='ignore')
+                            print(f"📝 [EMAIL] Найдено TXT вложение: {filename} ({len(txt_data)} bytes)")
+                            print(f"📄 [EMAIL] TXT содержимое: {txt_content[:300]}...")
+                            
+                            # Extract transcription after "следующего содержания:"
+                            if "следующего содержания:" in txt_content:
+                                parts = txt_content.split("следующего содержания:")
+                                if len(parts) > 1:
+                                    txt_transcription = parts[1].strip()
+                                    print(f"✅ [EMAIL] Извлечена транскрипция из TXT: {txt_transcription[:200]}...")
+                            else:
+                                # Use full text if no marker found
+                                txt_transcription = txt_content.strip()
+                                print(f"✅ [EMAIL] Используем полный текст TXT")
+                            break
+                        except Exception as e:
+                            print(f"❌ [EMAIL] Ошибка декодирования TXT: {e}")
+                    
+                    # Check for MP3 file
+                    elif filename and ".mp3" in filename.lower() and ("audio" in content_type or "octet-stream" in content_type):
+                        mp3_data = part.get_payload(decode=True)
+                        mp3_filename = filename
+                        print(f"🎵 [EMAIL] Найдено MP3 вложение: {filename} ({len(mp3_data)} bytes)")
+                        break
+        
+        # Transcribe MP3 using Whisper API if found
+        whisper_transcription = None
+        if mp3_data:
+            try:
+                import tempfile
+                import os
+                
+                # Save MP3 to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+                    tmp_file.write(mp3_data)
+                    tmp_path = tmp_file.name
+                
+                print(f"💾 [EMAIL] MP3 сохранён во временный файл: {tmp_path}")
+                
+                # Call Whisper API via httpx
+                print(f"🎙️  [EMAIL] Отправляю в Whisper API для транскрибации...")
+                
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    with open(tmp_path, "rb") as audio_file:
+                        files = {"file": (mp3_filename, audio_file, "audio/mpeg")}
+                        data = {
+                            "model": "whisper-1",
+                            "language": "ru"
+                        }
+                        
+                        whisper_response = await http_client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={
+                                "Authorization": f"Bearer {OPENAI_API_KEY}"
+                            },
+                            files=files,
+                            data=data
+                        )
+                        
+                        if whisper_response.status_code == 200:
+                            result = whisper_response.json()
+                            whisper_transcription = result.get("text", "")
+                            print(f"✅ [EMAIL] Транскрипция получена ({len(whisper_transcription)} символов)")
+                            print(f"📝 [EMAIL] Whisper транскрипция: {whisper_transcription[:200]}...")
+                        else:
+                            print(f"❌ [EMAIL] Whisper API error: {whisper_response.status_code}")
+                            print(f"   Response: {whisper_response.text}")
+                
+                # Clean up temp file
+                os.unlink(tmp_path)
+                
+            except Exception as e:
+                print(f"❌ [EMAIL] Ошибка транскрибации: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Convert form to dict for easier access
+        data = {
+            "headers": {},
+            "plain": plain_text,
+            "html": form_data.get("html", ""),
+            "from": form_data.get("from", ""),
+            "to": form_data.get("to", ""),
+            "subject": form_data.get("subject", ""),
+        }
         customer_id = data.get("customer_id")
         phone = data.get("phone")
 
@@ -5093,7 +5264,169 @@ async def freescout_webhook(request: Request):
     - convo.status - изменение статуса
     """
     try:
-        data = await request.json()
+        # SendGrid sends form-data, not JSON
+        form_data = await request.form()
+        
+        # DEBUG: Print all form fields
+        print("🐛 [DEBUG] All form-data fields:")
+        for key in form_data.keys():
+            value = form_data.get(key, "")
+            print(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
+        
+        # Parse raw email from SendGrid
+        raw_email = form_data.get("email", "")
+        
+        # DEBUG: Save raw email to file
+        if raw_email:
+            with open('/tmp/last_email.txt', 'w', encoding='utf-8') as f:
+                f.write(raw_email)
+            print(f"📧 [DEBUG] Raw email saved to /tmp/last_email.txt ({len(raw_email)} bytes)")
+        
+        email_msg = message_from_string(raw_email) if raw_email else None
+        
+        # Extract plain text from email
+        plain_text = ""
+        html_text = ""
+        
+        if email_msg:
+            if email_msg.is_multipart():
+                for part in email_msg.walk():
+                    content_type = part.get_content_type()
+                    if content_type == "text/plain" and not plain_text:
+                        try:
+                            plain_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+                    elif content_type == "text/html" and not html_text:
+                        try:
+                            html_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+            else:
+                try:
+                    payload = email_msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    if email_msg.get_content_type() == "text/html":
+                        html_text = payload
+                    else:
+                        plain_text = payload
+                except:
+                    pass
+        
+        # If no plain text, extract from HTML
+        if not plain_text and html_text:
+            # Remove HTML tags and get text
+            plain_text = re.sub(r'<[^>]+>', ' ', html_text)
+            plain_text = unescape(plain_text)
+            # Clean up whitespace
+            plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        
+        print(f"📧 [DEBUG] Extracted plain text ({len(plain_text)} chars): {plain_text[:300]}")
+        print(f"📧 [DEBUG] Had HTML: {len(html_text) > 0}")
+        
+        # Extract attachment from email (MP3 or TXT)
+        mp3_data = None
+        mp3_filename = None
+        txt_transcription = None
+        
+        if email_msg and email_msg.is_multipart():
+            for part in email_msg.walk():
+                content_disposition = part.get("Content-Disposition", "")
+                content_type = part.get_content_type()
+                
+                # Check if this is an attachment
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    
+                    # Check for TXT file with transcription
+                    if filename and ".txt" in filename.lower():
+                        txt_data = part.get_payload(decode=True)
+                        try:
+                            # Decode the text
+                            txt_content = txt_data.decode('utf-8', errors='ignore')
+                            print(f"📝 [EMAIL] Найдено TXT вложение: {filename} ({len(txt_data)} bytes)")
+                            print(f"📄 [EMAIL] TXT содержимое: {txt_content[:300]}...")
+                            
+                            # Extract transcription after "следующего содержания:"
+                            if "следующего содержания:" in txt_content:
+                                parts = txt_content.split("следующего содержания:")
+                                if len(parts) > 1:
+                                    txt_transcription = parts[1].strip()
+                                    print(f"✅ [EMAIL] Извлечена транскрипция из TXT: {txt_transcription[:200]}...")
+                            else:
+                                # Use full text if no marker found
+                                txt_transcription = txt_content.strip()
+                                print(f"✅ [EMAIL] Используем полный текст TXT")
+                            break
+                        except Exception as e:
+                            print(f"❌ [EMAIL] Ошибка декодирования TXT: {e}")
+                    
+                    # Check for MP3 file
+                    elif filename and ".mp3" in filename.lower() and ("audio" in content_type or "octet-stream" in content_type):
+                        mp3_data = part.get_payload(decode=True)
+                        mp3_filename = filename
+                        print(f"🎵 [EMAIL] Найдено MP3 вложение: {filename} ({len(mp3_data)} bytes)")
+                        break
+        
+        # Transcribe MP3 using Whisper API if found
+        whisper_transcription = None
+        if mp3_data:
+            try:
+                import tempfile
+                import os
+                
+                # Save MP3 to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+                    tmp_file.write(mp3_data)
+                    tmp_path = tmp_file.name
+                
+                print(f"💾 [EMAIL] MP3 сохранён во временный файл: {tmp_path}")
+                
+                # Call Whisper API via httpx
+                print(f"🎙️  [EMAIL] Отправляю в Whisper API для транскрибации...")
+                
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    with open(tmp_path, "rb") as audio_file:
+                        files = {"file": (mp3_filename, audio_file, "audio/mpeg")}
+                        data = {
+                            "model": "whisper-1",
+                            "language": "ru"
+                        }
+                        
+                        whisper_response = await http_client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={
+                                "Authorization": f"Bearer {OPENAI_API_KEY}"
+                            },
+                            files=files,
+                            data=data
+                        )
+                        
+                        if whisper_response.status_code == 200:
+                            result = whisper_response.json()
+                            whisper_transcription = result.get("text", "")
+                            print(f"✅ [EMAIL] Транскрипция получена ({len(whisper_transcription)} символов)")
+                            print(f"📝 [EMAIL] Whisper транскрипция: {whisper_transcription[:200]}...")
+                        else:
+                            print(f"❌ [EMAIL] Whisper API error: {whisper_response.status_code}")
+                            print(f"   Response: {whisper_response.text}")
+                
+                # Clean up temp file
+                os.unlink(tmp_path)
+                
+            except Exception as e:
+                print(f"❌ [EMAIL] Ошибка транскрибации: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Convert form to dict for easier access
+        data = {
+            "headers": {},
+            "plain": plain_text,
+            "html": form_data.get("html", ""),
+            "from": form_data.get("from", ""),
+            "to": form_data.get("to", ""),
+            "subject": form_data.get("subject", ""),
+        }
         event_type = data.get("event")
 
         print(f"📨 FreeScout webhook: {event_type}")
@@ -5225,7 +5558,169 @@ async def freescout_webhook(request: Request):
     - conversation.status_changed - изменение статуса
     """
     try:
-        data = await request.json()
+        # SendGrid sends form-data, not JSON
+        form_data = await request.form()
+        
+        # DEBUG: Print all form fields
+        print("🐛 [DEBUG] All form-data fields:")
+        for key in form_data.keys():
+            value = form_data.get(key, "")
+            print(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
+        
+        # Parse raw email from SendGrid
+        raw_email = form_data.get("email", "")
+        
+        # DEBUG: Save raw email to file
+        if raw_email:
+            with open('/tmp/last_email.txt', 'w', encoding='utf-8') as f:
+                f.write(raw_email)
+            print(f"📧 [DEBUG] Raw email saved to /tmp/last_email.txt ({len(raw_email)} bytes)")
+        
+        email_msg = message_from_string(raw_email) if raw_email else None
+        
+        # Extract plain text from email
+        plain_text = ""
+        html_text = ""
+        
+        if email_msg:
+            if email_msg.is_multipart():
+                for part in email_msg.walk():
+                    content_type = part.get_content_type()
+                    if content_type == "text/plain" and not plain_text:
+                        try:
+                            plain_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+                    elif content_type == "text/html" and not html_text:
+                        try:
+                            html_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+            else:
+                try:
+                    payload = email_msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    if email_msg.get_content_type() == "text/html":
+                        html_text = payload
+                    else:
+                        plain_text = payload
+                except:
+                    pass
+        
+        # If no plain text, extract from HTML
+        if not plain_text and html_text:
+            # Remove HTML tags and get text
+            plain_text = re.sub(r'<[^>]+>', ' ', html_text)
+            plain_text = unescape(plain_text)
+            # Clean up whitespace
+            plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        
+        print(f"📧 [DEBUG] Extracted plain text ({len(plain_text)} chars): {plain_text[:300]}")
+        print(f"📧 [DEBUG] Had HTML: {len(html_text) > 0}")
+        
+        # Extract attachment from email (MP3 or TXT)
+        mp3_data = None
+        mp3_filename = None
+        txt_transcription = None
+        
+        if email_msg and email_msg.is_multipart():
+            for part in email_msg.walk():
+                content_disposition = part.get("Content-Disposition", "")
+                content_type = part.get_content_type()
+                
+                # Check if this is an attachment
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    
+                    # Check for TXT file with transcription
+                    if filename and ".txt" in filename.lower():
+                        txt_data = part.get_payload(decode=True)
+                        try:
+                            # Decode the text
+                            txt_content = txt_data.decode('utf-8', errors='ignore')
+                            print(f"📝 [EMAIL] Найдено TXT вложение: {filename} ({len(txt_data)} bytes)")
+                            print(f"📄 [EMAIL] TXT содержимое: {txt_content[:300]}...")
+                            
+                            # Extract transcription after "следующего содержания:"
+                            if "следующего содержания:" in txt_content:
+                                parts = txt_content.split("следующего содержания:")
+                                if len(parts) > 1:
+                                    txt_transcription = parts[1].strip()
+                                    print(f"✅ [EMAIL] Извлечена транскрипция из TXT: {txt_transcription[:200]}...")
+                            else:
+                                # Use full text if no marker found
+                                txt_transcription = txt_content.strip()
+                                print(f"✅ [EMAIL] Используем полный текст TXT")
+                            break
+                        except Exception as e:
+                            print(f"❌ [EMAIL] Ошибка декодирования TXT: {e}")
+                    
+                    # Check for MP3 file
+                    elif filename and ".mp3" in filename.lower() and ("audio" in content_type or "octet-stream" in content_type):
+                        mp3_data = part.get_payload(decode=True)
+                        mp3_filename = filename
+                        print(f"🎵 [EMAIL] Найдено MP3 вложение: {filename} ({len(mp3_data)} bytes)")
+                        break
+        
+        # Transcribe MP3 using Whisper API if found
+        whisper_transcription = None
+        if mp3_data:
+            try:
+                import tempfile
+                import os
+                
+                # Save MP3 to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+                    tmp_file.write(mp3_data)
+                    tmp_path = tmp_file.name
+                
+                print(f"💾 [EMAIL] MP3 сохранён во временный файл: {tmp_path}")
+                
+                # Call Whisper API via httpx
+                print(f"🎙️  [EMAIL] Отправляю в Whisper API для транскрибации...")
+                
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    with open(tmp_path, "rb") as audio_file:
+                        files = {"file": (mp3_filename, audio_file, "audio/mpeg")}
+                        data = {
+                            "model": "whisper-1",
+                            "language": "ru"
+                        }
+                        
+                        whisper_response = await http_client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={
+                                "Authorization": f"Bearer {OPENAI_API_KEY}"
+                            },
+                            files=files,
+                            data=data
+                        )
+                        
+                        if whisper_response.status_code == 200:
+                            result = whisper_response.json()
+                            whisper_transcription = result.get("text", "")
+                            print(f"✅ [EMAIL] Транскрипция получена ({len(whisper_transcription)} символов)")
+                            print(f"📝 [EMAIL] Whisper транскрипция: {whisper_transcription[:200]}...")
+                        else:
+                            print(f"❌ [EMAIL] Whisper API error: {whisper_response.status_code}")
+                            print(f"   Response: {whisper_response.text}")
+                
+                # Clean up temp file
+                os.unlink(tmp_path)
+                
+            except Exception as e:
+                print(f"❌ [EMAIL] Ошибка транскрибации: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Convert form to dict for easier access
+        data = {
+            "headers": {},
+            "plain": plain_text,
+            "html": form_data.get("html", ""),
+            "from": form_data.get("from", ""),
+            "to": form_data.get("to", ""),
+            "subject": form_data.get("subject", ""),
+        }
         event_type = data.get("event")
 
         print(f"📨 FreeScout webhook: {event_type}")
@@ -5451,7 +5946,169 @@ async def update_freescout_conversation(
 async def amocrm_webhook(request: Request):
     """Обработчик webhook от AmoCRM"""
     try:
-        data = await request.json()
+        # SendGrid sends form-data, not JSON
+        form_data = await request.form()
+        
+        # DEBUG: Print all form fields
+        print("🐛 [DEBUG] All form-data fields:")
+        for key in form_data.keys():
+            value = form_data.get(key, "")
+            print(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
+        
+        # Parse raw email from SendGrid
+        raw_email = form_data.get("email", "")
+        
+        # DEBUG: Save raw email to file
+        if raw_email:
+            with open('/tmp/last_email.txt', 'w', encoding='utf-8') as f:
+                f.write(raw_email)
+            print(f"📧 [DEBUG] Raw email saved to /tmp/last_email.txt ({len(raw_email)} bytes)")
+        
+        email_msg = message_from_string(raw_email) if raw_email else None
+        
+        # Extract plain text from email
+        plain_text = ""
+        html_text = ""
+        
+        if email_msg:
+            if email_msg.is_multipart():
+                for part in email_msg.walk():
+                    content_type = part.get_content_type()
+                    if content_type == "text/plain" and not plain_text:
+                        try:
+                            plain_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+                    elif content_type == "text/html" and not html_text:
+                        try:
+                            html_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+            else:
+                try:
+                    payload = email_msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    if email_msg.get_content_type() == "text/html":
+                        html_text = payload
+                    else:
+                        plain_text = payload
+                except:
+                    pass
+        
+        # If no plain text, extract from HTML
+        if not plain_text and html_text:
+            # Remove HTML tags and get text
+            plain_text = re.sub(r'<[^>]+>', ' ', html_text)
+            plain_text = unescape(plain_text)
+            # Clean up whitespace
+            plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        
+        print(f"📧 [DEBUG] Extracted plain text ({len(plain_text)} chars): {plain_text[:300]}")
+        print(f"📧 [DEBUG] Had HTML: {len(html_text) > 0}")
+        
+        # Extract attachment from email (MP3 or TXT)
+        mp3_data = None
+        mp3_filename = None
+        txt_transcription = None
+        
+        if email_msg and email_msg.is_multipart():
+            for part in email_msg.walk():
+                content_disposition = part.get("Content-Disposition", "")
+                content_type = part.get_content_type()
+                
+                # Check if this is an attachment
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    
+                    # Check for TXT file with transcription
+                    if filename and ".txt" in filename.lower():
+                        txt_data = part.get_payload(decode=True)
+                        try:
+                            # Decode the text
+                            txt_content = txt_data.decode('utf-8', errors='ignore')
+                            print(f"📝 [EMAIL] Найдено TXT вложение: {filename} ({len(txt_data)} bytes)")
+                            print(f"📄 [EMAIL] TXT содержимое: {txt_content[:300]}...")
+                            
+                            # Extract transcription after "следующего содержания:"
+                            if "следующего содержания:" in txt_content:
+                                parts = txt_content.split("следующего содержания:")
+                                if len(parts) > 1:
+                                    txt_transcription = parts[1].strip()
+                                    print(f"✅ [EMAIL] Извлечена транскрипция из TXT: {txt_transcription[:200]}...")
+                            else:
+                                # Use full text if no marker found
+                                txt_transcription = txt_content.strip()
+                                print(f"✅ [EMAIL] Используем полный текст TXT")
+                            break
+                        except Exception as e:
+                            print(f"❌ [EMAIL] Ошибка декодирования TXT: {e}")
+                    
+                    # Check for MP3 file
+                    elif filename and ".mp3" in filename.lower() and ("audio" in content_type or "octet-stream" in content_type):
+                        mp3_data = part.get_payload(decode=True)
+                        mp3_filename = filename
+                        print(f"🎵 [EMAIL] Найдено MP3 вложение: {filename} ({len(mp3_data)} bytes)")
+                        break
+        
+        # Transcribe MP3 using Whisper API if found
+        whisper_transcription = None
+        if mp3_data:
+            try:
+                import tempfile
+                import os
+                
+                # Save MP3 to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+                    tmp_file.write(mp3_data)
+                    tmp_path = tmp_file.name
+                
+                print(f"💾 [EMAIL] MP3 сохранён во временный файл: {tmp_path}")
+                
+                # Call Whisper API via httpx
+                print(f"🎙️  [EMAIL] Отправляю в Whisper API для транскрибации...")
+                
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    with open(tmp_path, "rb") as audio_file:
+                        files = {"file": (mp3_filename, audio_file, "audio/mpeg")}
+                        data = {
+                            "model": "whisper-1",
+                            "language": "ru"
+                        }
+                        
+                        whisper_response = await http_client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={
+                                "Authorization": f"Bearer {OPENAI_API_KEY}"
+                            },
+                            files=files,
+                            data=data
+                        )
+                        
+                        if whisper_response.status_code == 200:
+                            result = whisper_response.json()
+                            whisper_transcription = result.get("text", "")
+                            print(f"✅ [EMAIL] Транскрипция получена ({len(whisper_transcription)} символов)")
+                            print(f"📝 [EMAIL] Whisper транскрипция: {whisper_transcription[:200]}...")
+                        else:
+                            print(f"❌ [EMAIL] Whisper API error: {whisper_response.status_code}")
+                            print(f"   Response: {whisper_response.text}")
+                
+                # Clean up temp file
+                os.unlink(tmp_path)
+                
+            except Exception as e:
+                print(f"❌ [EMAIL] Ошибка транскрибации: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Convert form to dict for easier access
+        data = {
+            "headers": {},
+            "plain": plain_text,
+            "html": form_data.get("html", ""),
+            "from": form_data.get("from", ""),
+            "to": form_data.get("to", ""),
+            "subject": form_data.get("subject", ""),
+        }
 
         print(f"📨 AmoCRM webhook получен")
         print(f"Data: {json.dumps(data, ensure_ascii=False, indent=2)}")
@@ -6170,6 +6827,1215 @@ async def mango_voice_events_call_alias(request: Request):
 async def mango_voice_events_summary_alias(request: Request):
     """Алиас для Voice events/summary от Mango (с /voice/ префиксом)"""
     return await mango_voice_webhook(request, event_type="summary")
+
+
+
+
+
+# ==================== ГОЛОСОВАЯ ПОЧТА ====================
+
+
+async def create_support_ticket(from_number: str, recording_url: str = "", call_duration: int = 0, transcription: str = "") -> Dict:
+    """
+    Создает тикет в FreeScout для технической поддержки
+
+    Вызывается когда клиент нажал клавишу "2" в IVR меню.
+    """
+    try:
+        print(f"🎫 [SUPPORT] Создание тикета для {from_number}")
+
+        # Нормализуем номер телефона
+        if not from_number.startswith('+'):
+            from_number = f'+{from_number}'
+
+        # AI генерация заголовка на основе транскрипции
+        subject = f"Техническая поддержка - звонок от {from_number}"  # Default
+        if transcription and len(transcription) > 10:
+            try:
+                print(f"🤖 [SUPPORT] Генерация заголовка на основе транскрипции")
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    response = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {OPENAI_API_KEY}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": "gpt-4",
+                            "messages": [
+                                {"role": "system", "content": "Ты - помощник службы поддержки. Создай краткий заголовок (макс 60 символов) для тикета на основе проблемы клиента."},
+                                {"role": "user", "content": f"Создай краткий заголовок для тикета поддержки: {transcription[:200]}"}
+                            ],
+                            "temperature": 0.3,
+                            "max_tokens": 50
+                        }
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        ai_subject = data["choices"][0]["message"]["content"].strip()
+                        ai_subject = ai_subject.strip('"').strip("'")
+                        if ai_subject and len(ai_subject) > 5:
+                            subject = ai_subject
+                            print(f"✅ [SUPPORT] AI заголовок: {subject}")
+            except Exception as e:
+                print(f"⚠️  [SUPPORT] Ошибка генерации заголовка: {e}")
+
+        # Format duration
+        duration_text = f"{call_duration // 60}м {call_duration % 60}с" if call_duration > 0 else "неизвестно"
+
+        # Prepare ticket body - только полезная информация
+        ticket_body = "Входящий звонок на голосовую почту (тех. поддержка)\n\n"
+
+        if from_number and from_number != "Не указан" and not from_number.startswith("+Не"):
+            ticket_body += f"📞 Телефон: {from_number}\n"
+
+        if call_duration > 0:
+            duration_text = f"{call_duration // 60}м {call_duration % 60}с"
+            ticket_body += f"⏱️ Длительность: {duration_text}\n"
+
+        # Создаем тикет в FreeScout (mailbox 1 - "Поддержка клиентов")
+        if not FREESCOUT_API_KEY:
+            print("❌ [SUPPORT] FreeScout API key не настроен")
+            return {"success": False, "error": "FreeScout not configured"}
+
+        customer_email = from_number.replace('+', '') + "@support.smit34.ru"
+        customer_name = f"Клиент {from_number}"
+
+        result = await create_freescout_ticket(
+            subject=subject,
+            customer_email=customer_email,
+            customer_name=customer_name,
+            message=ticket_body,
+            customer_phone=from_number,
+            mailbox_id=1,  # Поддержка клиентов
+            thread_type="message"
+        )
+
+        if result.get("success"):
+            ticket_number = result.get("ticket_number")
+            conversation_id = result.get("conversation_id")
+            print(f"✅ [SUPPORT] Тикет FreeScout #{ticket_number} создан (ID: {conversation_id})")
+            return {
+                "success": True,
+                "ticket_number": ticket_number,
+                "conversation_id": conversation_id,
+                "phone": from_number,
+                "type": "support"
+            }
+        else:
+            print(f"❌ [SUPPORT] Ошибка создания тикета: {result.get('error')}")
+            return {"success": False, "error": result.get("error")}
+
+    except Exception as e:
+        print(f"❌ [SUPPORT] Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+async def create_voicemail_lead(from_number: str, recording_url: str = "", call_duration: int = 0) -> Dict:
+    """
+    Создает лид в AmoCRM из голосовой заявки
+    
+    Вызывается когда клиент оставил голосовое сообщение на номере голосовой почты.
+    """
+    try:
+        print(f"📞 [VOICEMAIL] Создание лида для {from_number}")
+        
+        # Нормализуем номер телефона
+        if not from_number.startswith('+'):
+            from_number = f'+{from_number}'
+        
+        # Проверяем настройки AmoCRM
+        if not AMO_ACCESS_TOKEN:
+            print("❌ [VOICEMAIL] AmoCRM token не настроен")
+            return {"success": False, "error": "AmoCRM not configured"}
+        
+        headers = {
+            "Authorization": f"Bearer {AMO_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Создаем контакт
+            contact_data = [{
+                "name": f"Клиент {from_number}",
+                "custom_fields_values": [
+                    {
+                        "field_code": "PHONE",
+                        "values": [{"value": from_number, "enum_code": "WORK"}]
+                    }
+                ]
+            }]
+            
+            contact_response = await client.post(
+                f"{AMO_BASE_URL}/api/v4/contacts",
+                json=contact_data,
+                headers=headers
+            )
+            
+            contact_id = None
+            if contact_response.status_code in [200, 201]:
+                data = contact_response.json()
+                if data.get("_embedded") and data["_embedded"].get("contacts"):
+                    contact_id = data["_embedded"]["contacts"][0]["id"]
+                    print(f"✅ [VOICEMAIL] Контакт создан: {contact_id}")
+            
+            # Создаем лид
+            lead_data = {
+                "name": f"Голосовая заявка: {from_number}",
+                "price": 0,
+                "pipeline_id": AMO_PIPELINE_B2C_ID,
+                "status_id": 79103550,  # Новый
+                "responsible_user_id": AMO_DEFAULT_RESPONSIBLE_USER_ID
+            }
+            
+            if contact_id:
+                lead_data["_embedded"] = {"contacts": [{"id": contact_id}]}
+            
+            lead_response = await client.post(
+                f"{AMO_BASE_URL}/api/v4/leads",
+                json=[lead_data],
+                headers=headers
+            )
+            
+            if lead_response.status_code in [200, 201]:
+                data = lead_response.json()
+                if data.get("_embedded") and data["_embedded"].get("leads"):
+                    lead_id = data["_embedded"]["leads"][0]["id"]
+                    print(f"✅ [VOICEMAIL] Лид создан: {lead_id}")
+                    
+                    # Добавляем примечание с записью
+                    duration_text = f"{call_duration // 60}м {call_duration % 60}с" if call_duration > 0 else "неизвестно"
+                    
+                    note_text = "🎙️ Голосовая заявка на подключение\n\n"
+                    
+                    # Добавляем только полезную информацию
+                    if from_number and from_number != "Не указан" and not from_number.startswith("+Не"):
+                        note_text += f"📞 Телефон: {from_number}\n"
+                    
+                    if call_duration > 0:
+                        note_text += f"⏱️ Длительность: {duration_text}\n"
+                    
+
+                    
+                    note_data = [{
+                        "entity_id": lead_id,
+                        "note_type": "common",
+                        "params": {"text": note_text}
+                    }]
+                    
+                    note_response = await client.post(
+                        f"{AMO_BASE_URL}/api/v4/leads/notes",
+                        json=note_data,
+                        headers=headers
+                    )
+                    
+                    if note_response.status_code in [200, 201]:
+                        print(f"✅ [VOICEMAIL] Примечание добавлено к лиду {lead_id}")
+                    else:
+                        print(f"⚠️  [VOICEMAIL] Ошибка добавления примечания: {note_response.status_code} - {note_response.text}")
+                    
+                    return {
+                        "success": True,
+                        "lead_id": lead_id,
+                        "contact_id": contact_id,
+                        "phone": from_number
+                    }
+            
+            print(f"❌ [VOICEMAIL] Ошибка создания лида: {lead_response.text}")
+            return {"success": False, "error": lead_response.text}
+    
+    except Exception as e:
+        print(f"❌ [VOICEMAIL] Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+
+# Ping endpoint for Mango voicemail webhook
+@app.post("/webhooks/mango/voicemail/ping")
+async def mango_voicemail_ping():
+    """Ping endpoint for Mango webhook verification"""
+    return JSONResponse({"status": "ok", "message": "pong"})
+
+
+
+# Events endpoints for Mango voicemail
+@app.post("/webhooks/mango/voicemail/events/call")
+async def mango_voicemail_events_call(request: Request):
+    """Handle call events from Mango voicemail webhook"""
+    try:
+        form_data = await request.form()
+        json_data = form_data.get('json', '{}')
+        print(f"📞 [VOICEMAIL] Call event received")
+        return JSONResponse({"success": True, "status": "received"})
+    except Exception as e:
+        print(f"❌ [VOICEMAIL] Call event error: {str(e)}")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/webhooks/mango/voicemail/events/summary")
+async def mango_voicemail_events_summary(request: Request):
+    """Handle summary events - creates lead or ticket based on DTMF"""
+    try:
+        form_data = await request.form()
+        json_data = form_data.get('json', '{}')
+        received_sign = form_data.get('sign', '')
+
+        print(f"📞 [VOICEMAIL] Summary event received")
+
+        # Check signature if mango_client available
+        if mango_client and not mango_client.verify_webhook_signature(json_data, received_sign):
+            print("❌ [VOICEMAIL] Invalid signature")
+            return JSONResponse({"success": False, "message": "Invalid signature"}, status_code=403)
+
+        data = json.loads(json_data)
+
+        # Extract data
+        from_number = data.get('from', {}).get('number', '')
+        if not from_number:
+            from_number = data.get('from_number', '')
+
+        call_id = data.get('call_id', data.get('seq', ''))
+        entry_id = data.get('entry_id', '')
+        call_duration = int(data.get('talk_time', 0))
+
+        print(f"📞 [VOICEMAIL] Call from: {from_number}")
+        print(f"   Call ID: {call_id}")
+        print(f"   Entry ID: {entry_id}")
+        print(f"   Duration: {call_duration}s")
+
+        # Check which key was pressed (default to '1' if not found)
+        pressed_key = dtmf_cache.get(entry_id, '1')
+        print(f"🔑 [VOICEMAIL] Нажата клавиша: {pressed_key}")
+
+        # Clean up cache
+        if entry_id in dtmf_cache:
+            del dtmf_cache[entry_id]
+
+        # ВАЖНО: Сохраняем данные звонка для email endpoint СРАЗУ
+        # Email может прийти раньше чем получим запись звонка
+        global last_voicemail_data
+        last_voicemail_data = {
+            'from_number': from_number,
+            'recording_url': '',  # Пока пустая, обновим позже
+            'call_duration': call_duration,
+            'pressed_key': pressed_key,
+            'entry_id': entry_id
+        }
+        print(f"💾 [VOICEMAIL] Данные сохранены для email endpoint")
+        print(f"   Номер: {from_number}")
+        print(f"   Клавиша: {pressed_key}")
+        print(f"   Entry ID: {entry_id}")
+
+        # Get recording URL if entry_id available (в фоне, не блокируя)
+        recording_url = ""
+        if mango_client and entry_id:
+            print(f"🔍 [VOICEMAIL] Запрашиваем запись для entry_id: {entry_id}")
+            # Wait for recording processing
+            import asyncio
+            await asyncio.sleep(3)
+
+            print(f"⏳ [VOICEMAIL] Вызываем get_recordings_by_entry...")
+            recordings_result = await mango_client.get_recordings_by_entry(entry_id)
+            print(f"📊 [VOICEMAIL] Результат API: {recordings_result}")
+
+            if recordings_result.get('success'):
+                recordings = recordings_result.get('recordings', [])
+                print(f"📝 [VOICEMAIL] Найдено записей: {len(recordings)}")
+
+                if recordings:
+                    recording = recordings[-1] if len(recordings) > 1 else recordings[0]
+                    recording_id = recording.get('recording_id', '')
+                    print(f"🎙️  [VOICEMAIL] Recording ID: {recording_id}")
+
+                    if recording_id:
+                        recording_url = f"https://app.mango-office.ru/media/call_records/{recording_id}"
+                        print(f"✅ [VOICEMAIL] Recording URL: {recording_url}")
+
+                        # Обновляем recording_url в кеше
+                        if last_voicemail_data and last_voicemail_data.get('entry_id') == entry_id:
+                            last_voicemail_data['recording_url'] = recording_url
+                            print(f"✅ [VOICEMAIL] Recording URL добавлен в кеш")
+                else:
+                    print(f"⚠️  [VOICEMAIL] Массив recordings пустой")
+            else:
+                error = recordings_result.get('error', 'Unknown')
+                print(f"❌ [VOICEMAIL] Ошибка получения записей: {error}")
+        elif not entry_id:
+            print(f"⚠️  [VOICEMAIL] entry_id отсутствует в webhook")
+        elif not mango_client:
+            print(f"⚠️  [VOICEMAIL] mango_client не инициализирован")
+
+        return JSONResponse({"success": True, "message": "Waiting for email with transcription"})
+
+    except Exception as e:
+        print(f"❌ [VOICEMAIL] Summary event error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/webhooks/mango/voicemail/events/dtmf")
+async def mango_voicemail_dtmf(request: Request):
+    """Handle DTMF (key press) events from Mango voicemail"""
+    try:
+        form_data = await request.form()
+        json_data = form_data.get('json', '{}')
+
+        data = json.loads(json_data)
+
+        # Extract data
+        digit = data.get('dtmf', '')
+        from_number = data.get('from', {}).get('number', '')
+        if not from_number:
+            from_number = data.get('from_number', '')
+
+        call_id = data.get('call_id', data.get('seq', ''))
+        entry_id = data.get('entry_id', '')
+
+        print(f"📞 [DTMF] Нажата клавиша: {digit}")
+        print(f"   От номера: {from_number}")
+        print(f"   Call ID: {call_id}")
+        print(f"   Entry ID: {entry_id}")
+
+        # Log full webhook data
+        print(f"📋 [DTMF] Полные данные webhook:")
+        import json as json_module
+        print(json_module.dumps(data, indent=2, ensure_ascii=False))
+
+        # Store DTMF key in cache for routing
+        if entry_id and digit:
+            dtmf_cache[entry_id] = digit
+            print(f"💾 [DTMF] Сохранено в кеш: entry_id={entry_id}, digit={digit}")
+
+        return JSONResponse({"success": True, "status": "received", "digit": digit})
+
+    except Exception as e:
+        print(f"❌ [DTMF] Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/webhooks/mango/voicemail")
+async def mango_voicemail_webhook(request: Request):
+    """
+    Специальный webhook для голосовой почты
+    
+    Манго отправляет сюда данные когда завершается звонок на голосовую почту
+    """
+    try:
+        form_data = await request.form()
+        json_data = form_data.get('json', '{}')
+        received_sign = form_data.get('sign', '')
+        
+        print(f"📞 [VOICEMAIL] Webhook получен")
+        
+        # Проверяем подпись если mango_client доступен
+        if mango_client and not mango_client.verify_webhook_signature(json_data, received_sign):
+            print("❌ [VOICEMAIL] Неверная подпись")
+            return JSONResponse({"success": False, "message": "Invalid signature"}, status_code=403)
+        
+        data = json.loads(json_data)
+        
+        # Извлекаем данные
+        from_number = data.get('from', {}).get('number', '')
+        if not from_number:
+            # Пробуем альтернативный формат
+            from_number = data.get('from_number', '')
+        
+        call_id = data.get('call_id', data.get('seq', ''))
+        entry_id = data.get('entry_id', '')
+        
+        print(f"📞 [VOICEMAIL] Звонок от: {from_number}")
+        print(f"   Call ID: {call_id}")
+        print(f"   Entry ID: {entry_id}")
+        
+        # Если есть entry_id, получаем запись
+        recording_url = ""
+        call_duration = int(data.get('talk_time', 0))
+        
+        if mango_client and entry_id:
+            # Даем время на обработку записи в Манго
+            import asyncio
+            await asyncio.sleep(3)
+            
+            # Получаем список записей
+            recordings_result = await mango_client.get_recordings_by_entry(entry_id)
+            if recordings_result.get('success'):
+                recordings = recordings_result.get('recordings', [])
+                if recordings:
+                    recording = recordings[-1] if len(recordings) > 1 else recordings[0]
+                    recording_id = recording.get('recording_id', '')
+                    if recording_id:
+                        # Формируем URL записи (публичный URL от Манго)
+                        recording_url = f"https://app.mango-office.ru/media/call_records/{recording_id}"
+                        print(f"🎙️  [VOICEMAIL] Запись: {recording_url}")
+        
+        # Создаем лид
+        result = await create_voicemail_lead(
+            from_number=from_number,
+            recording_url=recording_url,
+            call_duration=call_duration
+        )
+        
+        return JSONResponse(result)
+    
+    except Exception as e:
+        print(f"❌ [VOICEMAIL] Исключение: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+# ==================== КОНЕЦ ГОЛОСОВОЙ ПОЧТЫ ====================
+
+# ==================== AI ПРЕДМОДЕРАЦИЯ ГОЛОСОВОЙ ПОЧТЫ ====================
+
+async def ai_analyze_voicemail(transcription: str, phone: str) -> Dict:
+    """
+    AI анализ транскрипции голосового сообщения
+
+    Извлекает:
+    - Адрес клиента
+    - Тип запроса (подключение интернета / тех поддержка)
+    - Суть проблемы
+    """
+    try:
+        print(f"🤖 AI анализ транскрипции ({len(transcription)} символов)")
+
+        prompt = f"""Проанализируй голосовое сообщение клиента интернет-провайдера.
+
+ТРАНСКРИПЦИЯ:
+{transcription}
+
+ТЕЛЕФОН КЛИЕНТА: {phone}
+
+Извлеки следующую информацию и верни в JSON формате:
+
+{{
+  "address": "адрес подключения (если упомянут, иначе null)",
+  "request_type": "connection" или "support",
+  "issue": "краткое описание проблемы/запроса",
+  "confidence": "high" или "low" (уверенность в распознавании)
+}}
+
+Правила:
+1. Адрес в формате: "Город, улица дом"
+2. request_type = "connection" если клиент называет адрес для подключения интернета
+3. request_type = "support" если у клиента проблема с интернетом (не работает, медленный, отваливается и т.п.)
+4. issue - 1-2 предложения, что хочет клиент
+5. confidence = "high" если адрес чётко назван (город + улица + номер дома), "low" если адрес не упомянут или неполный
+
+ВАЖНО: 
+- Если клиент просто называет адрес БЕЗ упоминания проблемы = это запрос на ПОДКЛЮЧЕНИЕ (connection)
+- Если упоминает проблему ("не работает", "медленный интернет" и т.п.) = это тех. поддержка (support)
+
+Верни ТОЛЬКО JSON, без дополнительного текста."""
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4",
+                    "messages": [
+                        {"role": "system", "content": "Ты - AI помощник для анализа голосовых сообщений. Возвращаешь только JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 300
+                }
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                gpt_response = data["choices"][0]["message"]["content"]
+
+                # Парсим JSON из ответа GPT
+                import json
+                # Убираем markdown если есть
+                gpt_response = gpt_response.replace("```json", "").replace("```", "").strip()
+                analysis = json.loads(gpt_response)
+
+                print(f"✅ AI анализ завершен:")
+                print(f"   Адрес: {analysis.get('address')}")
+                print(f"   Тип: {analysis.get('request_type')}")
+                print(f"   Проблема: {analysis.get('issue')}")
+                print(f"   Уверенность: {analysis.get('confidence')}")
+
+                return {
+                    "success": True,
+                    "analysis": analysis
+                }
+            else:
+                print(f"❌ OpenAI ошибка: {response.status_code}")
+                return {"success": False, "error": "OpenAI error"}
+
+    except Exception as e:
+        print(f"❌ AI анализ ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+
+@app.get("/webhooks/mango/email")
+async def mango_voicemail_email_verify():
+    """Verification endpoint for CloudMailin (responds to GET)"""
+    print("✅ [EMAIL] GET verification request received")
+    return JSONResponse({"status": "ok", "message": "Email webhook ready"})
+
+
+@app.post("/webhooks/mango/email")
+async def mango_voicemail_email(request: Request):
+    """
+    Webhook от SendGrid Inbound Parse с транскрипцией голосового сообщения
+
+    CloudMailin парсит email от Mango и отправляет JSON:
+    {
+      "headers": {...},
+      "envelope": {...},
+      "plain": "текст письма",
+      "html": "HTML версия",
+      ...
+    }
+    """
+    try:
+        # SendGrid sends form-data, not JSON
+        form_data = await request.form()
+        
+        # DEBUG: Print all form fields
+        print("🐛 [DEBUG] All form-data fields:")
+        for key in form_data.keys():
+            value = form_data.get(key, "")
+            print(f"   {key}: {value[:200] if len(str(value)) > 200 else value}")
+        
+        # Parse raw email from SendGrid
+        raw_email = form_data.get("email", "")
+        
+        # DEBUG: Save raw email to file
+        if raw_email:
+            with open('/tmp/last_email.txt', 'w', encoding='utf-8') as f:
+                f.write(raw_email)
+            print(f"📧 [DEBUG] Raw email saved to /tmp/last_email.txt ({len(raw_email)} bytes)")
+        
+        email_msg = message_from_string(raw_email) if raw_email else None
+        
+        # Extract plain text from email
+        plain_text = ""
+        html_text = ""
+        
+        if email_msg:
+            if email_msg.is_multipart():
+                for part in email_msg.walk():
+                    content_type = part.get_content_type()
+                    if content_type == "text/plain" and not plain_text:
+                        try:
+                            plain_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+                    elif content_type == "text/html" and not html_text:
+                        try:
+                            html_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+            else:
+                try:
+                    payload = email_msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    if email_msg.get_content_type() == "text/html":
+                        html_text = payload
+                    else:
+                        plain_text = payload
+                except:
+                    pass
+        
+        # If no plain text, extract from HTML
+        if not plain_text and html_text:
+            # Remove HTML tags and get text
+            plain_text = re.sub(r'<[^>]+>', ' ', html_text)
+            plain_text = unescape(plain_text)
+            # Clean up whitespace
+            plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        
+        print(f"📧 [DEBUG] Extracted plain text ({len(plain_text)} chars): {plain_text[:300]}")
+        print(f"📧 [DEBUG] Had HTML: {len(html_text) > 0}")
+        
+        # Extract attachment from email (MP3 or TXT)
+        mp3_data = None
+        mp3_filename = None
+        txt_transcription = None
+        
+        if email_msg and email_msg.is_multipart():
+            for part in email_msg.walk():
+                content_disposition = part.get("Content-Disposition", "")
+                content_type = part.get_content_type()
+                
+                # Check if this is an attachment
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    
+                    # Check for TXT file with transcription
+                    if filename and ".txt" in filename.lower():
+                        txt_data = part.get_payload(decode=True)
+                        try:
+                            # Decode the text
+                            txt_content = txt_data.decode('utf-8', errors='ignore')
+                            print(f"📝 [EMAIL] Найдено TXT вложение: {filename} ({len(txt_data)} bytes)")
+                            print(f"📄 [EMAIL] TXT содержимое: {txt_content[:300]}...")
+                            
+                            # Extract transcription after "следующего содержания:"
+                            if "следующего содержания:" in txt_content:
+                                parts = txt_content.split("следующего содержания:")
+                                if len(parts) > 1:
+                                    txt_transcription = parts[1].strip()
+                                    print(f"✅ [EMAIL] Извлечена транскрипция из TXT: {txt_transcription[:200]}...")
+                            else:
+                                # Use full text if no marker found
+                                txt_transcription = txt_content.strip()
+                                print(f"✅ [EMAIL] Используем полный текст TXT")
+                            break
+                        except Exception as e:
+                            print(f"❌ [EMAIL] Ошибка декодирования TXT: {e}")
+                    
+                    # Check for MP3 file
+                    elif filename and ".mp3" in filename.lower() and ("audio" in content_type or "octet-stream" in content_type):
+                        mp3_data = part.get_payload(decode=True)
+                        mp3_filename = filename
+                        print(f"🎵 [EMAIL] Найдено MP3 вложение: {filename} ({len(mp3_data)} bytes)")
+                        break
+        
+        # Transcribe MP3 using Whisper API if found
+        whisper_transcription = None
+        if mp3_data:
+            try:
+                import tempfile
+                import os
+                
+                # Save MP3 to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+                    tmp_file.write(mp3_data)
+                    tmp_path = tmp_file.name
+                
+                print(f"💾 [EMAIL] MP3 сохранён во временный файл: {tmp_path}")
+                
+                # Call Whisper API via httpx
+                print(f"🎙️  [EMAIL] Отправляю в Whisper API для транскрибации...")
+                
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    with open(tmp_path, "rb") as audio_file:
+                        files = {"file": (mp3_filename, audio_file, "audio/mpeg")}
+                        data = {
+                            "model": "whisper-1",
+                            "language": "ru"
+                        }
+                        
+                        whisper_response = await http_client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={
+                                "Authorization": f"Bearer {OPENAI_API_KEY}"
+                            },
+                            files=files,
+                            data=data
+                        )
+                        
+                        if whisper_response.status_code == 200:
+                            result = whisper_response.json()
+                            whisper_transcription = result.get("text", "")
+                            print(f"✅ [EMAIL] Транскрипция получена ({len(whisper_transcription)} символов)")
+                            print(f"📝 [EMAIL] Whisper транскрипция: {whisper_transcription[:200]}...")
+                        else:
+                            print(f"❌ [EMAIL] Whisper API error: {whisper_response.status_code}")
+                            print(f"   Response: {whisper_response.text}")
+                
+                # Clean up temp file
+                os.unlink(tmp_path)
+                
+            except Exception as e:
+                print(f"❌ [EMAIL] Ошибка транскрибации: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Convert form to dict for easier access
+        data = {
+            "headers": {},
+            "plain": plain_text,
+            "html": form_data.get("html", ""),
+            "from": form_data.get("from", ""),
+            "to": form_data.get("to", ""),
+            "subject": form_data.get("subject", ""),
+        }
+
+        print("="*60)
+        print("📧 [EMAIL] Получено письмо от CloudMailin")
+
+        # Извлекаем данные
+        subject = data.get("headers", {}).get("Subject", "")
+        plain_body = data.get("plain", "")
+        html_body = data.get("html", "")
+        from_email = data.get("headers", {}).get("From", "")
+
+        print(f"   От: {from_email}")
+        print(f"   Тема: {subject}")
+        print(f"   Размер текста: {len(plain_body)} символов")
+
+        # Извлекаем транскрипцию из письма
+        # Приоритет: TXT вложение > Whisper транскрипция > plain_body
+        if txt_transcription:
+            transcription = txt_transcription.strip()
+            print(f"✅ [EMAIL] Используем транскрипцию из TXT вложения")
+        elif whisper_transcription:
+            transcription = whisper_transcription.strip()
+            print(f"✅ [EMAIL] Используем транскрипцию из Whisper API")
+        else:
+            transcription = plain_body.strip()
+            print(f"⚠️  [EMAIL] Используем plain_body (нет TXT/Whisper)")
+
+        # Проверяем транскрипцию только если не было MP3
+        if not whisper_transcription and (not transcription or len(transcription) < 10):
+            print("⚠️  [EMAIL] Транскрипция пустая или слишком короткая, и MP3 не найден")
+            return JSONResponse({
+                "success": False,
+                "message": "Empty transcription and no MP3 found"
+            })
+
+        print(f"📝 [EMAIL] Транскрипция:")
+        print(f"   {transcription[:200]}..." if len(transcription) > 200 else f"   {transcription}")
+
+        # Извлекаем номер телефона из last_voicemail_data (данные последнего звонка)
+        global last_voicemail_data
+        if last_voicemail_data and last_voicemail_data.get('from_number'):
+            phone = last_voicemail_data['from_number']
+            recording_url = last_voicemail_data.get('recording_url', '')
+            call_duration = last_voicemail_data.get('call_duration', 0)
+            pressed_key = last_voicemail_data.get('pressed_key', '1')
+            print(f"📞 [EMAIL] Данные из последнего звонка:")
+            print(f"   Телефон: {phone}")
+            print(f"   Клавиша: {pressed_key}")
+        else:
+            # Fallback: пытаемся извлечь из транскрипции
+            print(f"⚠️  [EMAIL] last_voicemail_data пуст, извлекаем номер из текста")
+            phone_match = re.search(r'\+?[78]\d{10}', subject + " " + transcription)
+            phone = phone_match.group(0) if phone_match else "Не указан"
+            if not phone.startswith('+') and phone != "Не указан":
+                phone = f'+{phone}'
+            recording_url = ''
+            call_duration = 0
+            pressed_key = '1'
+            print(f"📞 [EMAIL] Телефон: {phone}")
+
+        # === AI АНАЛИЗ ТРАНСКРИПЦИИ ===
+        ai_result = await ai_analyze_voicemail(transcription, phone)
+
+        if not ai_result.get("success"):
+            print("❌ [EMAIL] AI анализ не удался, создаем базовый лид")
+            # Создаем лид без AI анализа
+            result = await create_voicemail_lead(
+                from_number=phone,
+                recording_url="",
+                call_duration=0
+            )
+            return JSONResponse(result)
+
+        analysis = ai_result.get("analysis", {})
+        address = analysis.get("address")
+        request_type = analysis.get("request_type", "connection")
+        issue = analysis.get("issue", transcription[:200])
+        confidence = analysis.get("confidence", "low")
+
+        # === ПРОВЕРКА АДРЕСА (если указан) ===
+        address_available = False
+        address_full = None
+
+        if address and confidence == "high":
+            # Нормализуем адрес: заменяем словесные числительные на цифровые
+            address_normalized = address
+            
+            # Замены для порядковых числительных (1-я, 2-я...)
+            replacements = {
+                'Первая': '1-я',
+                'первая': '1-я',
+                'Вторая': '2-я',
+                'вторая': '2-я',
+                'Третья': '3-я',
+                'третья': '3-я',
+                'Четвертая': '4-я',
+                'четвертая': '4-я',
+                'Четвёртая': '4-я',
+                'четвёртая': '4-я',
+                'Пятая': '5-я',
+                'пятая': '5-я',
+                'Шестая': '6-я',
+                'шестая': '6-я',
+                'Седьмая': '7-я',
+                'седьмая': '7-я',
+                'Восьмая': '8-я',
+                'восьмая': '8-я',
+                'Девятая': '9-я',
+                'девятая': '9-я',
+                'Десятая': '10-я',
+                'десятая': '10-я',
+                # Количественные числительные (для 50 лет Октября и т.п.)
+                'Пятьдесят': '50',
+                'пятьдесят': '50',
+                'Сорок': '40',
+                'сорок': '40',
+                'Тридцать': '30',
+                'тридцать': '30',
+                'Двадцать': '20',
+                'двадцать': '20',
+                'Десять': '10',
+                'десять': '10',
+                'Одиннадцать': '11',
+                'одиннадцать': '11',
+                'Двенадцать': '12',
+                'двенадцать': '12',
+                'Тринадцать': '13',
+                'тринадцать': '13',
+                'Четырнадцать': '14',
+                'четырнадцать': '14',
+                'Пятнадцать': '15',
+                'пятнадцать': '15',
+                'Шестнадцать': '16',
+                'шестнадцать': '16',
+                'Семнадцать': '17',
+                'семнадцать': '17',
+                'Восемнадцать': '18',
+                'восемнадцать': '18',
+                'Девятнадцать': '19',
+                'девятнадцать': '19',
+                'Шестьдесят': '60',
+                'шестьдесят': '60',
+                'Семьдесят': '70',
+                'семьдесят': '70',
+                'Восемьдесят': '80',
+                'восемьдесят': '80',
+                'Девяносто': '90',
+                'девяносто': '90',
+                'Сто': '100',
+                'сто': '100'
+            }
+            
+            for word, replacement in replacements.items():
+                address_normalized = address_normalized.replace(word, replacement)
+            
+            if address != address_normalized:
+                print(f"📝 [EMAIL] Адрес нормализован: {address} → {address_normalized}")
+            
+            print(f"🔍 [EMAIL] Проверяем адрес: {address_normalized}")
+
+            # Используем существующую функцию check_address_gas
+            address_check = await check_address_gas(address_normalized)
+
+            if address_check.get("available"):
+                address_available = True
+                address_full = address_check.get("address_full")
+                print(f"✅ [EMAIL] Адрес доступен: {address_full}")
+            else:
+                print(f"⚠️  [EMAIL] Адрес НЕ доступен для подключения")
+        else:
+            print(f"⚠️  [EMAIL] Адрес не указан или низкая уверенность")
+
+        # === ПРИНЯТИЕ РЕШЕНИЯ ===
+
+        if request_type == "support":
+            # Тех поддержка → Тикет
+            print(f"🎫 [EMAIL] Создаем тикет тех поддержки")
+            result = await create_support_ticket(
+                from_number=phone,
+                recording_url="",
+                call_duration=0,
+                transcription=transcription
+            )
+
+            # Добавляем AI анализ в примечание
+            if result.get("success") and result.get("lead_id"):
+                await add_ai_analysis_note(result["lead_id"], analysis, transcription)
+
+        elif address_available:
+            # Адрес доступен → Лид на подключение
+            print(f"💼 [EMAIL] Создаем лид на подключение (адрес доступен)")
+            result = await create_voicemail_lead(
+                from_number=phone,
+                recording_url="",
+                call_duration=0
+            )
+
+            # Добавляем AI анализ + адрес в примечание
+            if result.get("success") and result.get("lead_id"):
+                lead_id = result["lead_id"]
+                await add_ai_analysis_note(
+                    lead_id,
+                    analysis,
+                    transcription,
+                    address_full=address_full
+                )
+                
+                # Создаём задачу "Позвонить клиенту"
+                await create_task_for_lead(lead_id, "Продать интернет от СМИТ")
+
+        else:
+            # Адрес НЕ доступен → Список ожидания
+            print(f"⏳ [EMAIL] Адрес недоступен, добавляем в список ожидания")
+            result = await add_to_waitlist(
+                phone=phone,
+                address=address or "Не указан",
+                issue=issue,
+                transcription=transcription
+            )
+
+        print("="*60)
+        return JSONResponse(result)
+
+    except Exception as e:
+        print(f"❌ [EMAIL] Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
+
+
+
+
+async def create_task_for_lead(lead_id: int, text: str = "Продать интернет от СМИТ"):
+    """Создаёт задачу в AmoCRM для лида"""
+    try:
+        import time
+        from datetime import datetime, timedelta
+        
+        # Рабочее время: 9:00 - 18:00, пн-пт
+        now = datetime.now()
+        
+        # Вычисляем срок: через 1 час в рабочее время
+        target_time = now + timedelta(hours=1)
+        
+        # Проверяем день недели (0=понедельник, 6=воскресенье)
+        if now.weekday() >= 5:  # Суббота или воскресенье
+            # Переносим на понедельник 10:00
+            days_until_monday = 7 - now.weekday()
+            target_time = (now + timedelta(days=days_until_monday)).replace(hour=10, minute=0, second=0)
+            print(f"📅 [TASK] Выходной день, срок перенесён на понедельник 10:00")
+        elif now.hour < 9:
+            # До начала рабочего дня → срок 10:00 сегодня
+            target_time = now.replace(hour=10, minute=0, second=0)
+            print(f"📅 [TASK] До рабочего дня, срок установлен на 10:00")
+        elif now.hour >= 18:
+            # После рабочего дня → срок 10:00 следующего рабочего дня
+            if now.weekday() == 4:  # Пятница
+                target_time = (now + timedelta(days=3)).replace(hour=10, minute=0, second=0)
+            else:
+                target_time = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0)
+            print(f"📅 [TASK] После рабочего дня, срок перенесён на следующий день 10:00")
+        elif target_time.hour >= 18:
+            # Через час будет после 18:00 → срок 18:00 сегодня
+            target_time = now.replace(hour=18, minute=0, second=0)
+            print(f"📅 [TASK] Срок через час выходит за рабочее время, установлен на 18:00")
+        else:
+            # В рабочее время, через час тоже в рабочее время
+            print(f"📅 [TASK] Срок установлен через 1 час: {target_time.strftime('%H:%M')}")
+        
+        complete_till = int(target_time.timestamp())
+        
+        headers = {
+            "Authorization": f"Bearer {AMO_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        task_data = [{
+            "task_type_id": 1,  # Тип "Звонок"
+            "text": text,
+            "complete_till": complete_till,
+            "entity_id": lead_id,
+            "entity_type": "leads",
+            "responsible_user_id": AMO_DEFAULT_RESPONSIBLE_USER_ID
+        }]
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{AMO_BASE_URL}/api/v4/tasks",
+                headers=headers,
+                json=task_data
+            )
+            
+            if response.status_code in [200, 201]:
+                result = response.json()
+                task_id = result.get("_embedded", {}).get("tasks", [{}])[0].get("id")
+                print(f"✅ [EMAIL] Задача создана: ID {task_id}")
+                return {"success": True, "task_id": task_id}
+            else:
+                print(f"❌ [EMAIL] Ошибка создания задачи: {response.status_code}")
+                print(f"   Response: {response.text}")
+                return {"success": False, "error": response.text}
+    except Exception as e:
+        print(f"❌ [EMAIL] Исключение при создании задачи: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+async def add_ai_analysis_note(lead_id: int, analysis: Dict, transcription: str, address_full: str = None):
+    """Добавляет примечание с AI анализом к лиду"""
+    try:
+        note_text = f"""🤖 AI Анализ голосового сообщения:
+
+📍 Адрес: {analysis.get('address', 'Не указан')}
+{f"✅ Адрес доступен для подключения: {address_full}" if address_full else ""}
+
+📋 Тип запроса: {"Подключение интернета" if analysis.get('request_type') == 'connection' else "Тех. поддержка"}
+
+💬 Суть обращения:
+{analysis.get('issue', 'Не определено')}
+
+📝 Транскрипция:
+{transcription}
+
+🎯 Уверенность AI: {analysis.get('confidence', 'low').upper()}
+"""
+
+        headers = {
+            "Authorization": f"Bearer {AMO_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        note_data = [{
+            "entity_id": lead_id,
+            "note_type": "common",
+            "params": {"text": note_text}
+        }]
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{AMO_BASE_URL}/api/v4/leads/notes",
+                json=note_data,
+                headers=headers
+            )
+
+            if response.status_code in [200, 201]:
+                print(f"✅ [EMAIL] AI анализ добавлен к лиду {lead_id}")
+            else:
+                print(f"⚠️  [EMAIL] Ошибка добавления примечания: {response.status_code}")
+
+    except Exception as e:
+        print(f"❌ [EMAIL] Ошибка add_ai_analysis_note: {e}")
+
+
+async def add_to_waitlist(phone: str, address: str, issue: str, transcription: str) -> Dict:
+    """
+    Добавляет клиента в список ожидания (адрес недоступен)
+
+    Создает лид в AmoCRM с особой меткой
+    """
+    try:
+        print(f"⏳ [WAITLIST] Добавляем в список ожидания: {phone}")
+
+        if not phone.startswith('+'):
+            phone = f'+{phone}'
+
+        headers = {
+            "Authorization": f"Bearer {AMO_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Создаем контакт
+            contact_data = [{
+                "name": f"Клиент {phone}",
+                "custom_fields_values": [
+                    {
+                        "field_code": "PHONE",
+                        "values": [{"value": phone, "enum_code": "WORK"}]
+                    }
+                ]
+            }]
+
+            contact_response = await client.post(
+                f"{AMO_BASE_URL}/api/v4/contacts",
+                json=contact_data,
+                headers=headers
+            )
+
+            contact_id = None
+            if contact_response.status_code in [200, 201]:
+                data = contact_response.json()
+                if data.get("_embedded") and data["_embedded"].get("contacts"):
+                    contact_id = data["_embedded"]["contacts"][0]["id"]
+
+            # Создаем лид в список ожидания
+            lead_data = {
+                "name": f"СПИСОК ОЖИДАНИЯ: {address}",
+                "price": 0,
+                "pipeline_id": AMO_PIPELINE_B2C_ID,
+                "status_id": 79103550,  # Новый
+                "responsible_user_id": AMO_DEFAULT_RESPONSIBLE_USER_ID
+            }
+
+            if contact_id:
+                lead_data["_embedded"] = {"contacts": [{"id": contact_id}]}
+
+            lead_response = await client.post(
+                f"{AMO_BASE_URL}/api/v4/leads",
+                json=[lead_data],
+                headers=headers
+            )
+
+            if lead_response.status_code in [200, 201]:
+                data = lead_response.json()
+                if data.get("_embedded") and data["_embedded"].get("leads"):
+                    lead_id = data["_embedded"]["leads"][0]["id"]
+                    print(f"✅ [WAITLIST] Лид создан: {lead_id}")
+
+                    # Добавляем примечание
+                    note_text = f"""⏳ СПИСОК ОЖИДАНИЯ
+
+📍 Запрошенный адрес: {address}
+❌ Адрес пока недоступен для подключения
+
+📞 Телефон: {phone}
+💬 Запрос клиента: {issue}
+
+📝 Транскрипция голосового сообщения:
+{transcription}
+
+⚠️ Свяжитесь с клиентом когда адрес станет доступен!
+"""
+
+                    note_data = [{
+                        "entity_id": lead_id,
+                        "note_type": "common",
+                        "params": {"text": note_text}
+                    }]
+
+                    await client.post(
+                        f"{AMO_BASE_URL}/api/v4/leads/notes",
+                        json=note_data,
+                        headers=headers
+                    )
+
+                    return {
+                        "success": True,
+                        "lead_id": lead_id,
+                        "contact_id": contact_id,
+                        "status": "waitlist",
+                        "message": "Добавлен в список ожидания"
+                    }
+
+            return {"success": False, "error": "Failed to create lead"}
+
+    except Exception as e:
+        print(f"❌ [WAITLIST] Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+# ==================== КОНЕЦ AI ПРЕДМОДЕРАЦИИ ====================
+
 
 if __name__ == "__main__":
     import uvicorn
