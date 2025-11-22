@@ -1,0 +1,8 @@
+# FreeScout Configuration
+FREESCOUT_URL=https://support.smit34.ru
+FREESCOUT_API_KEY=ваш_freescout_api_key
+FREESCOUT_MAILBOX_ID=2
+
+# MAX Bot Configuration
+MAX_BOT_TOKEN=ваш_max_bot_token
+MAX_BOT_ID=ваш_max_bot_id
